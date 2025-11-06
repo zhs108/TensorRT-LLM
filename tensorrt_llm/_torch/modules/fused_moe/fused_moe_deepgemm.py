@@ -1,3 +1,4 @@
+import os
 from typing import Dict, List, Optional, Union
 
 import torch
@@ -413,6 +414,11 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             layer_idx=layer_idx,
         )
 
+        # Debug function for eliminating imbalance during performance analysis.
+        self.enable_dummy_allreduce = os.environ.get(
+            "TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
+        print(f"enable_dummy_allreduce: {self.enable_dummy_allreduce}")
+
     def get_workspace(self, m_max: int, group_size: int):
         capture_graph = torch.cuda.is_current_stream_capturing()
         hidden_size = self.hidden_size
@@ -462,6 +468,30 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         else:
             return UnquantizedFusedMoEMethod()
 
+    def dummy_allreduce(self):
+        """
+        Debug function for eliminating imbalance during performance analysis.
+        Creates a small dummy tensor and performs allreduce to synchronize processes
+        and eliminate timing imbalances for more accurate profiling measurements.
+        """
+        dummy_tensor = torch.zeros(4, dtype=torch.float32, device='cuda')
+        dummy_tensor = self.all_reduce(dummy_tensor)
+        return dummy_tensor
+
+    def reducescatter_or_allreduce(
+        self,
+        inputs,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+    ):
+        """
+        Override parent method to add dummy allreduce before communication.
+        """
+        if self.enable_dummy_allreduce:
+            self.dummy_allreduce()
+        return super().reducescatter_or_allreduce(
+            inputs, all_rank_num_tokens, use_dp_padding)
+
     @nvtx_range("[DG] forward")
     def forward_chunk(
         self,
@@ -508,6 +538,8 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
         use_allgather = self.use_dp and self.parallel_size > 1
         if use_allgather:
+            if self.enable_dummy_allreduce:
+                self.dummy_allreduce()
             x, x_sf, token_selected_experts, token_final_scales = allgather(
                 [x, x_sf, token_selected_experts, token_final_scales],
                 self.mapping,
@@ -693,6 +725,8 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                 all_rank_num_tokens=all_rank_num_tokens_padded,
                 use_dp_padding=use_dp_padding,
                 workspace=workspace)
+            if self.enable_dummy_allreduce:
+                self.dummy_allreduce()
             outputs = self.reducescatter_or_allreduce(
                 outputs,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
@@ -738,6 +772,8 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                     workspace=workspace)
 
             def _reducescatter_or_allreduce(x_, idx):
+                if self.enable_dummy_allreduce:
+                    self.dummy_allreduce()
                 return self.reducescatter_or_allreduce(
                     x_,
                     all_rank_num_tokens=all_rank_num_tokens_list[idx],
